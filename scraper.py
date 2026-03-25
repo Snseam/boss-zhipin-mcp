@@ -1,10 +1,19 @@
 """BOSS 直聘 page scraper — works with SPA iframe-based search UI."""
 
 import asyncio
+import base64
 import os
 import tempfile
 from browser import BossBrowser
 from config import BOSS_BASE_URL
+
+try:
+    from PIL import Image
+    from pyzbar.pyzbar import decode as decode_qr
+    import io
+    HAS_QR_DECODER = True
+except ImportError:
+    HAS_QR_DECODER = False
 
 SCREENSHOT_DIR = os.path.join(tempfile.gettempdir(), "boss-recruiter-screenshots")
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
@@ -299,6 +308,14 @@ class BossScraper:
                 f.write(shot)
             paths.append(path)
 
+        # Extract share link by clicking the forward icon on canvas
+        share_url = ""
+        share_card_path = ""
+        try:
+            share_url, share_card_path = await self._extract_share_link(p, resume_iframe_el, index)
+        except Exception:
+            pass
+
         # Close the dialog via JS
         await p.evaluate("""() => {
             document.querySelectorAll('div.dialog-wrap').forEach(d => d.remove());
@@ -310,8 +327,105 @@ class BossScraper:
         return {
             "screenshots": paths,
             "ids": ids,
+            "share_url": share_url,
+            "share_card": share_card_path,
             "pages": len(paths),
         }
+
+    async def _extract_share_link(self, p, resume_iframe_el, index: int) -> tuple[str, str]:
+        """Click the forward icon on canvas, extract QR code, decode share URL.
+
+        Returns:
+            (share_url, share_card_path) tuple
+        """
+        if not resume_iframe_el:
+            return "", ""
+
+        resume_frame = await resume_iframe_el.content_frame()
+        if not resume_frame:
+            return "", ""
+
+        # Click the forward/share icon on the canvas (position found by scanning)
+        # The icon is at approximately (844, 55) in canvas coordinates
+        # Try a few nearby positions in case layout varies slightly
+        for fx, fy in [(844, 55), (850, 55), (838, 55), (844, 60), (850, 60)]:
+            await resume_frame.evaluate(f"""() => {{
+                const canvas = document.querySelector('canvas');
+                if (!canvas) return;
+                canvas.dispatchEvent(new MouseEvent('click', {{
+                    clientX: {fx}, clientY: {fy}, bubbles: true
+                }}));
+            }}""")
+            await asyncio.sleep(0.5)
+
+            # Check if share options popup appeared (站内同事 / 转发至其他)
+            has_share = await p.evaluate("""() => {
+                const els = document.querySelectorAll('.c-pay-4-another, .boss-popup__wrapper');
+                for (const el of els) {
+                    if (el.offsetWidth > 0 && (el.innerText || '').includes('转发')) return true;
+                }
+                return false;
+            }""")
+            if has_share:
+                break
+        else:
+            return "", ""
+
+        await asyncio.sleep(0.5)
+
+        # Click "转发至其他" to show QR code card
+        await p.evaluate("""() => {
+            const items = document.querySelectorAll('.c-pay-4-another .item, .nav-list .item');
+            for (const item of items) {
+                if ((item.innerText || '').includes('转发至其他')) {
+                    item.click();
+                    return true;
+                }
+            }
+            return false;
+        }""")
+        await asyncio.sleep(2)
+
+        # Extract the share card image (base64 PNG with QR code)
+        img_data = await p.evaluate("""() => {
+            const img = document.querySelector('img.share-image');
+            return img ? img.src : '';
+        }""")
+
+        share_url = ""
+        share_card_path = ""
+
+        if img_data.startswith("data:image/"):
+            # Save share card image
+            b64 = img_data.split(",", 1)[1]
+            img_bytes = base64.b64decode(b64)
+            share_card_path = os.path.join(SCREENSHOT_DIR, f"share_{index}.png")
+            with open(share_card_path, "wb") as f:
+                f.write(img_bytes)
+
+            # Decode QR code to get share URL
+            if HAS_QR_DECODER:
+                try:
+                    img = Image.open(io.BytesIO(img_bytes))
+                    results = decode_qr(img)
+                    if results:
+                        share_url = results[0].data.decode("utf-8")
+                except Exception:
+                    pass
+
+        # Close the share panel (but keep resume dialog)
+        await p.evaluate("""() => {
+            const panels = document.querySelectorAll('.c-pay-4-another');
+            panels.forEach(panel => {
+                const wrapper = panel.closest('.boss-popup__wrapper');
+                if (wrapper && wrapper.parentElement) {
+                    wrapper.parentElement.remove();
+                }
+            });
+        }""")
+        await asyncio.sleep(0.3)
+
+        return share_url, share_card_path
 
     async def greet_by_index(self, index: int, message: str = "") -> dict:
         """Click the Nth candidate in search results and send a greeting.
