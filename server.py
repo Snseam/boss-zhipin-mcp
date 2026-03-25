@@ -248,6 +248,24 @@ async def boss_view_by_index(index: int) -> dict:
 
 
 @mcp.tool()
+async def boss_greet_by_index(index: int, message: str = "") -> dict:
+    """在搜索结果中直接对候选人打招呼/发起沟通。
+
+    点击候选人卡片后，自动点击「联系Ta」按钮。
+    打招呼后候选人会进入 BOSS 直聘的「沟通」列表，可永久找到。
+
+    Args:
+        index: 候选人在搜索结果中的索引（0-based）
+        message: 自定义招呼消息（可选）
+
+    Returns:
+        发送结果，包含候选人标识符（geekId, expectId）
+    """
+    scraper = await get_scraper()
+    return await scraper.greet_by_index(index, message)
+
+
+@mcp.tool()
 async def boss_evaluate_candidate(
     resume: dict,
     job_requirements: str = "",

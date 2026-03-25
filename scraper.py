@@ -80,12 +80,13 @@ EXTRACT_CARDS_JS = """() => {
 
         const expectId = link ? link.getAttribute("data-expect") : "";
         const lid = link ? link.getAttribute("data-lid") : "";
+        const jid = link ? link.getAttribute("data-jid") : "";
 
         results.push({
             index: idx, name, age, experience, education, jobStatus, salary,
             skills: skills.slice(0, 8),
             expectCity, company, title, school, major,
-            expectId, lid,
+            expectId, lid, jid,
             fullText: text.slice(0, 500)
         });
     }
@@ -277,6 +278,19 @@ class BossScraper:
                         if (canvas) canvas.style.transform = 'translateY(0px)';
                     }""")
 
+        # Extract geekId and other identifiers from dialog
+        ids = await p.evaluate("""() => {
+            const el = document.querySelector('[data-geekid]');
+            if (!el) return {};
+            return {
+                geekId: el.getAttribute('data-geekid') || '',
+                encryptUserId: el.getAttribute('data-encryptuserid') || '',
+                expectId: el.getAttribute('data-expectid') || '',
+                securityId: (el.getAttribute('data-securityid') || '').slice(0, 50) + '...',
+                jid: el.getAttribute('data-jid') || '',
+            };
+        }""")
+
         # Save screenshots to temp files
         paths = []
         for i, shot in enumerate(all_screenshots):
@@ -295,8 +309,106 @@ class BossScraper:
 
         return {
             "screenshots": paths,
+            "ids": ids,
             "pages": len(paths),
         }
+
+    async def greet_by_index(self, index: int, message: str = "") -> dict:
+        """Click the Nth candidate in search results and send a greeting.
+
+        After greeting, the candidate appears in the "沟通" chat list permanently.
+
+        Args:
+            index: 0-based index of the candidate card
+            message: Custom greeting message (optional)
+
+        Returns:
+            Result with status and candidate identifiers
+        """
+        p = self.browser.page
+
+        # Close any existing dialog
+        await p.evaluate("""() => {
+            document.querySelectorAll('div.dialog-wrap').forEach(d => d.remove());
+            document.querySelectorAll('.boss-layer__wrapper').forEach(l => l.remove());
+            document.querySelectorAll('.boss-popup__wrapper').forEach(l => l.remove());
+        }""")
+        await asyncio.sleep(0.5)
+
+        # Get search frame
+        if not self._search_frame:
+            iframe_el = await p.query_selector("#searchContent iframe")
+            if iframe_el:
+                self._search_frame = await iframe_el.content_frame()
+        frame = self._search_frame
+        if not frame:
+            return {"status": "error", "message": "搜索 iframe 不可用"}
+
+        # Click the candidate card
+        clicked = await frame.evaluate(f"""() => {{
+            const cards = document.querySelectorAll("li.geek-info-card a[data-contact]");
+            if ({index} >= cards.length) return false;
+            cards[{index}].click();
+            return true;
+        }}""")
+
+        if not clicked:
+            return {"status": "error", "message": f"索引 {index} 超出范围"}
+
+        await asyncio.sleep(3)
+
+        # Extract candidate identifiers from dialog
+        ids = await p.evaluate("""() => {
+            const el = document.querySelector('[data-geekid]');
+            if (!el) return {};
+            return {
+                geekId: el.getAttribute('data-geekid') || '',
+                expectId: el.getAttribute('data-expectid') || '',
+                jid: el.getAttribute('data-jid') || '',
+            };
+        }""")
+
+        # Click "联系Ta" button
+        try:
+            greet_btn = await p.query_selector("button.btn-getcontact, .btn-getcontact")
+            if not greet_btn:
+                # Close dialog and return error
+                await p.evaluate("""() => {
+                    document.querySelectorAll('div.dialog-wrap').forEach(d => d.remove());
+                    document.querySelectorAll('.boss-layer__wrapper').forEach(l => l.remove());
+                }""")
+                return {"status": "error", "message": "未找到联系按钮", "ids": ids}
+
+            await greet_btn.click()
+            await asyncio.sleep(3)
+
+            # Check if a chat window / message input appeared
+            # If custom message, try to type and send
+            if message:
+                chat_input = await p.query_selector("textarea, .chat-input, [contenteditable='true']")
+                if chat_input:
+                    await chat_input.fill("")
+                    await chat_input.type(message, delay=50)
+                    await asyncio.sleep(0.5)
+                    send_btn = await p.query_selector("button:has-text('发送'), .btn-send")
+                    if send_btn:
+                        await send_btn.click()
+                        await asyncio.sleep(1)
+
+            result = {"status": "success", "message": "已发送招呼，候选人已进入沟通列表", "ids": ids}
+
+        except Exception as e:
+            result = {"status": "error", "message": str(e), "ids": ids}
+
+        # Close dialog
+        await p.evaluate("""() => {
+            document.querySelectorAll('div.dialog-wrap').forEach(d => d.remove());
+            document.querySelectorAll('.boss-layer__wrapper').forEach(l => l.remove());
+            document.querySelectorAll('.boss-popup__wrapper').forEach(l => l.remove());
+        }""")
+        await asyncio.sleep(0.5)
+
+        return result
 
     async def view_candidate(self, profile_url: str) -> dict:
         """View detailed candidate resume by URL (legacy, may not work in SPA)."""
