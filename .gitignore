@@ -1,0 +1,15 @@
+# User config (contains company info)
+search_profile.yaml
+
+# Runtime data
+seen_candidates.json
+cookies/
+chrome-profile/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store

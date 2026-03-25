@@ -1,0 +1,4 @@
+fastmcp>=2.0
+playwright>=1.40
+anthropic>=0.30
+pyyaml>=6.0

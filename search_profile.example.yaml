@@ -1,0 +1,42 @@
+# Boss Recruiter Search Profile — Example Configuration
+# Copy this file to search_profile.yaml and customize for your needs.
+
+job:
+  title: "AI Product Manager"
+  salary: "20-30K"
+  city: "北京"
+  experience: "3-5年"
+
+company:
+  name: "Your Company"
+  description: "Brief description of your company and product"
+
+requirements:
+  must_have:
+    - "3-5 years product management experience"
+    - "AI/LLM product experience"
+  nice_to_have:
+    - "Relevant industry background"
+    - "Technical background"
+
+filter:
+  max_age: 35
+  max_salary_k: 40
+  exclude_status: ["暂不考虑"]
+
+keywords:
+  # Direct match — exact role titles
+  - "AI产品经理"
+  - "AIGC产品经理"
+  # Domain — industry-specific variations
+  - "教育科技 产品经理"
+  # Technology — specific tech skills
+  - "大模型 产品"
+  - "RAG 产品经理"
+  # Product type — adjacent product categories
+  - "SaaS 产品经理"
+
+scoring:
+  domain_keywords: ["教育", "学术", "科研"]
+  tech_keywords: ["大模型", "llm", "rag", "prompt", "agent", "aigc"]
+  bonus_keywords: ["0-1", "从0到1"]
