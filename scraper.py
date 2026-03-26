@@ -2,6 +2,8 @@
 
 import asyncio
 import base64
+import functools
+import logging
 import os
 import tempfile
 from browser import BossBrowser
@@ -15,8 +17,32 @@ try:
 except ImportError:
     HAS_QR_DECODER = False
 
+log = logging.getLogger("boss-scraper")
+
 SCREENSHOT_DIR = os.path.join(tempfile.gettempdir(), "boss-recruiter-screenshots")
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+
+# --- Retry decorator for resilient operations ---
+
+def retry(max_attempts=3, delay=1.0):
+    """Retry async methods with automatic dialog cleanup between attempts."""
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(self, *args, **kwargs):
+            last_error = None
+            for attempt in range(max_attempts):
+                try:
+                    return await func(self, *args, **kwargs)
+                except Exception as e:
+                    last_error = e
+                    log.warning(f"{func.__name__} attempt {attempt+1} failed: {e}")
+                    if attempt < max_attempts - 1:
+                        await self._cleanup_dialogs()
+                        await asyncio.sleep(delay)
+            raise last_error
+        return wrapper
+    return decorator
 
 CITY_CODES = {
     "北京": "101010100", "上海": "101020100", "广州": "101280100",
@@ -110,6 +136,34 @@ class BossScraper:
         self.browser = browser
         self._search_frame = None  # cache the search iframe
 
+    async def _cleanup_dialogs(self):
+        """Clean up all dialog overlays that might block interactions."""
+        p = self.browser.page
+        await p.evaluate("""() => {
+            document.querySelectorAll('div.dialog-wrap').forEach(d => d.remove());
+            document.querySelectorAll('.boss-layer__wrapper').forEach(l => l.remove());
+            document.querySelectorAll('.boss-popup__wrapper').forEach(l => l.remove());
+            document.querySelectorAll('.c-pay-4-another').forEach(el => {
+                const wrapper = el.closest('.boss-popup__wrapper');
+                if (wrapper && wrapper.parentElement) wrapper.parentElement.remove();
+            });
+        }""")
+        await asyncio.sleep(0.5)
+
+    async def _find_share_icon_position(self, resume_frame) -> tuple[int, int] | None:
+        """Dynamically calculate the forward icon position on canvas."""
+        canvas_size = await resume_frame.evaluate("""() => {
+            const c = document.querySelector('canvas');
+            return c ? {w: c.offsetWidth, h: c.offsetHeight} : null;
+        }""")
+        if not canvas_size:
+            return None
+        # Forward icon is at ~94% width, ~9.5% height of canvas
+        x = int(canvas_size['w'] * 0.938)
+        y = int(canvas_size['h'] * 0.095)
+        return (x, y)
+
+    @retry(max_attempts=3, delay=1.0)
     async def _get_search_frame(self, p):
         """Navigate to search page and return the search iframe's Frame object."""
         search_menu = await p.query_selector("dl.menu-geeksearch")
@@ -152,6 +206,25 @@ class BossScraper:
         if not search_input:
             return [{"error": "无法找到搜索输入框"}]
 
+        # Set up network interception to capture API data
+        api_candidates = []
+
+        async def _capture_api(response):
+            try:
+                url = response.url
+                if ("geeks.json" in url or "searchGeek" in url
+                        or ("zpgeek" in url and "search" in url)):
+                    data = await response.json()
+                    if isinstance(data, dict):
+                        geek_list = data.get("zpData", {}).get("geekList", [])
+                        if not geek_list:
+                            geek_list = data.get("data", {}).get("list", [])
+                        api_candidates.extend(geek_list)
+            except Exception:
+                pass
+
+        p.on("response", _capture_api)
+
         # Clear and type keyword
         await search_input.click()
         await search_input.fill("")
@@ -164,6 +237,7 @@ class BossScraper:
         try:
             await frame.wait_for_selector("li.geek-info-card", timeout=10000)
         except Exception:
+            p.remove_listener("response", _capture_api)
             return [{"error": "搜索超时，未找到候选人卡片"}]
 
         await self.browser.random_delay()
@@ -186,8 +260,30 @@ class BossScraper:
                     break  # no more to load
                 loaded = new_loaded
 
-        # Extract all candidate cards
+        # Stop network interception
+        p.remove_listener("response", _capture_api)
+
+        # Extract candidate cards from DOM
         candidates = await frame.evaluate(EXTRACT_CARDS_JS)
+
+        # Enrich DOM candidates with API data if available
+        if api_candidates:
+            api_by_expect = {}
+            for ac in api_candidates:
+                eid = str(ac.get("expectId", ac.get("encryptExpectId", "")))
+                if eid:
+                    api_by_expect[eid] = ac
+            for c in candidates:
+                api = api_by_expect.get(c.get("expectId", ""))
+                if api:
+                    # Merge richer API fields (only if missing from DOM parse)
+                    if not c.get("salary") and api.get("salaryDesc"):
+                        c["salary"] = api["salaryDesc"]
+                    if api.get("geekName"):
+                        c["_apiName"] = api["geekName"]
+                    if api.get("encryptGeekId"):
+                        c["geekId"] = api["encryptGeekId"]
+
         return candidates
 
     async def view_candidate_by_index(self, index: int) -> dict:
@@ -201,20 +297,14 @@ class BossScraper:
         """
         p = self.browser.page
 
-        # Close any existing dialog FIRST (before any other interaction)
-        await p.evaluate("""() => {
-            document.querySelectorAll('div.dialog-wrap').forEach(d => d.remove());
-            document.querySelectorAll('.boss-layer__wrapper').forEach(l => l.remove());
-            document.querySelectorAll('.boss-popup__wrapper').forEach(l => l.remove());
-        }""")
-        await asyncio.sleep(0.5)
+        # Close any existing dialog FIRST
+        await self._cleanup_dialogs()
 
-        # Ensure we have the search frame
+        # Ensure we have the search frame (with retry)
         if not self._search_frame:
             await self._get_search_frame(p)
         frame = self._search_frame
         if not frame:
-            # Try getting iframe directly without clicking menu
             iframe_el = await p.query_selector("#searchContent iframe")
             if iframe_el:
                 self._search_frame = await iframe_el.content_frame()
@@ -345,10 +435,13 @@ class BossScraper:
         if not resume_frame:
             return "", ""
 
-        # Click the forward/share icon on the canvas (position found by scanning)
-        # The icon is at approximately (844, 55) in canvas coordinates
-        # Try a few nearby positions in case layout varies slightly
-        for fx, fy in [(844, 55), (850, 55), (838, 55), (844, 60), (850, 60)]:
+        # Dynamically calculate forward icon position based on canvas size
+        base_pos = await self._find_share_icon_position(resume_frame)
+        if not base_pos:
+            return "", ""
+        bx, by = base_pos
+        # Try the calculated position + a few nearby offsets
+        for fx, fy in [(bx, by), (bx+6, by), (bx-6, by), (bx, by+5), (bx+6, by+5)]:
             await resume_frame.evaluate(f"""() => {{
                 const canvas = document.querySelector('canvas');
                 if (!canvas) return;
@@ -442,12 +535,7 @@ class BossScraper:
         p = self.browser.page
 
         # Close any existing dialog
-        await p.evaluate("""() => {
-            document.querySelectorAll('div.dialog-wrap').forEach(d => d.remove());
-            document.querySelectorAll('.boss-layer__wrapper').forEach(l => l.remove());
-            document.querySelectorAll('.boss-popup__wrapper').forEach(l => l.remove());
-        }""")
-        await asyncio.sleep(0.5)
+        await self._cleanup_dialogs()
 
         # Get search frame
         if not self._search_frame:
@@ -515,12 +603,7 @@ class BossScraper:
             result = {"status": "error", "message": str(e), "ids": ids}
 
         # Close dialog
-        await p.evaluate("""() => {
-            document.querySelectorAll('div.dialog-wrap').forEach(d => d.remove());
-            document.querySelectorAll('.boss-layer__wrapper').forEach(l => l.remove());
-            document.querySelectorAll('.boss-popup__wrapper').forEach(l => l.remove());
-        }""")
-        await asyncio.sleep(0.5)
+        await self._cleanup_dialogs()
 
         return result
 
