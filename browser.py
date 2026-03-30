@@ -51,9 +51,57 @@ class BossBrowser:
                 log.info(f"Auto-detected Chrome at port {port}")
                 return
 
-        # Strategy 3: Launch new Chromium
-        log.info("No running Chrome found, launching new Chromium instance")
+        # Strategy 3: Launch system Chrome with debug port, then connect via CDP
+        log.info("No running Chrome found, launching system Chrome with debug port")
+        launched_port = await self._launch_system_chrome()
+        if launched_port:
+            cdp_url = f"http://localhost:{launched_port}"
+            if await self._try_cdp_connect(cdp_url):
+                log.info(f"Connected to system Chrome at port {launched_port}")
+                return
+
+        # Strategy 4: Fallback to bare Chromium (no user profile)
+        log.info("System Chrome launch failed, falling back to bare Chromium")
         await self._launch_new_browser()
+
+    async def _launch_system_chrome(self) -> int | None:
+        """Launch system Chrome with --remote-debugging-port.
+
+        Uses the user's default Chrome profile so existing cookies/logins are available.
+        Returns the debug port if successful, None otherwise.
+        """
+        import subprocess
+        import platform
+
+        port = 9222
+        system = platform.system()
+        if system == "Darwin":
+            chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        elif system == "Linux":
+            chrome_path = "google-chrome"
+        else:
+            chrome_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+
+        try:
+            subprocess.Popen(
+                [chrome_path, f"--remote-debugging-port={port}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            # Wait for Chrome to start and debug port to be ready
+            for _ in range(15):
+                await asyncio.sleep(1)
+                try:
+                    import urllib.request
+                    urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=2)
+                    return port
+                except Exception:
+                    continue
+        except FileNotFoundError:
+            log.warning(f"Chrome not found at {chrome_path}")
+        except Exception as e:
+            log.warning(f"Failed to launch system Chrome: {e}")
+        return None
 
     async def _try_cdp_connect(self, url: str) -> bool:
         """Try to connect to Chrome via CDP at the given URL."""

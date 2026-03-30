@@ -136,6 +136,24 @@ class BossScraper:
         self.browser = browser
         self._search_frame = None  # cache the search iframe
 
+    async def get_visible_expect_ids(self) -> list[str]:
+        """Return all expectIds currently visible on the search page."""
+        frame = self._search_frame
+        if not frame:
+            return []
+        try:
+            return await frame.evaluate("""() => {
+                const links = document.querySelectorAll("li.geek-info-card a[data-contact]");
+                const ids = [];
+                for (const link of links) {
+                    const eid = link.getAttribute('data-expect');
+                    if (eid) ids.push(eid);
+                }
+                return ids;
+            }""")
+        except Exception:
+            return []
+
     async def _cleanup_dialogs(self):
         """Clean up all dialog overlays that might block interactions."""
         p = self.browser.page
@@ -167,6 +185,14 @@ class BossScraper:
     async def _get_search_frame(self, p):
         """Navigate to search page and return the search iframe's Frame object."""
         search_menu = await p.query_selector("dl.menu-geeksearch")
+        if not search_menu:
+            # Not on recruiter SPA — navigate there first
+            from config import BOSS_SEARCH_URL
+            log.info(f"Navigating to recruiter search page: {BOSS_SEARCH_URL}")
+            await p.goto(BOSS_SEARCH_URL, wait_until="domcontentloaded")
+            await asyncio.sleep(3)
+            search_menu = await p.query_selector("dl.menu-geeksearch")
+
         if search_menu:
             await search_menu.click()
             await asyncio.sleep(2)

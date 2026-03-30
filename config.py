@@ -12,8 +12,11 @@ BOSS_SEARCH_URL = "https://www.zhipin.com/web/boss/recommend"
 COOKIES_DIR = os.path.join(os.path.dirname(__file__), "cookies")
 COOKIES_FILE = os.path.join(COOKIES_DIR, "boss_cookies.json")
 
-# 去重记录
+# 去重记录（旧版，迁移用）
 DEDUP_FILE = os.path.join(os.path.dirname(__file__), "seen_candidates.json")
+
+# 候选人数据库（新版，替代去重池）
+CANDIDATE_DB_FILE = os.path.join(os.path.dirname(__file__), "candidates_db.json")
 
 # 浏览器配置
 BROWSER_HEADLESS = False  # 首次登录需要 GUI
