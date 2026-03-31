@@ -89,7 +89,23 @@ async def boss_search_candidates(
         候选人列表（已去重），附带 _stats 统计信息
     """
     scraper = await get_scraper()
-    all_candidates = await scraper.search_candidates(keyword, city, experience, salary, count)
+    browser = await get_browser()
+
+    try:
+        all_candidates = await scraper.search_candidates(keyword, city, experience, salary, count)
+    except Exception as e:
+        # Check if it's a verification/CAPTCHA issue
+        verify = await browser.check_and_screenshot_verification()
+        if verify:
+            return [verify]
+        return [{"error": str(e), "message": "搜索失败，请检查浏览器状态"}]
+
+    # Check for error responses from scraper
+    if all_candidates and isinstance(all_candidates[0], dict) and all_candidates[0].get("error"):
+        verify = await browser.check_and_screenshot_verification()
+        if verify:
+            return [verify]
+        return all_candidates
 
     new_candidates = []
     for c in all_candidates:
@@ -153,8 +169,31 @@ async def boss_multi_search(
     all_new_candidates = []
     per_keyword_stats = []
 
+    browser = await get_browser()
+
     for i, kw in enumerate(keywords):
-        raw = await scraper.search_candidates(kw, city, experience, "", count_per_keyword)
+        try:
+            raw = await scraper.search_candidates(kw, city, experience, "", count_per_keyword)
+        except Exception as e:
+            # Check for verification CAPTCHA
+            verify = await browser.check_and_screenshot_verification()
+            if verify:
+                # Return partial results + verification notice
+                verify["_partial"] = True
+                verify["completed_keywords"] = i
+                return [verify] + per_keyword_stats + all_new_candidates
+            log.warning(f"search '{kw}' failed: {e}")
+            continue
+
+        # Check for error responses
+        if raw and isinstance(raw[0], dict) and raw[0].get("error"):
+            verify = await browser.check_and_screenshot_verification()
+            if verify:
+                verify["_partial"] = True
+                verify["completed_keywords"] = i
+                return [verify] + per_keyword_stats + all_new_candidates
+            log.warning(f"search '{kw}' returned error: {raw[0].get('error')}")
+            continue
 
         new_for_kw = []
         for c in raw:
@@ -184,6 +223,14 @@ async def boss_multi_search(
                 except Exception as e:
                     view_failed += 1
                     log.warning(f"view_by_index({idx}) failed for {c.get('name', '?')}: {e}")
+                    # Check for verification on view failure
+                    verify = await browser.check_and_screenshot_verification()
+                    if verify:
+                        verify["_partial"] = True
+                        verify["completed_keywords"] = i + 1
+                        verify["viewed_before_stop"] = viewed
+                        _db._save()
+                        return [verify] + per_keyword_stats + all_new_candidates
 
         kw_stat = {
             "_keyword_stats": True,

@@ -82,9 +82,12 @@ class BossBrowser:
         else:
             chrome_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 
+        # Use a dedicated user-data-dir so debug port works even if Chrome was running
+        profile_dir = os.path.join(os.path.dirname(__file__), "chrome-profile")
         try:
             subprocess.Popen(
-                [chrome_path, f"--remote-debugging-port={port}"],
+                [chrome_path, f"--remote-debugging-port={port}",
+                 f"--user-data-dir={profile_dir}"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -179,20 +182,23 @@ class BossBrowser:
             pass
 
     async def is_logged_in(self) -> bool:
-        """Check if currently logged in to BOSS 直聘."""
+        """Check if currently logged in to BOSS 直聘.
+
+        First tries to check from current page without navigation.
+        Only navigates if current page is not a BOSS page.
+        """
+        # Try checking current page first (no navigation)
+        try:
+            current_url = self.page.url
+            if "zhipin.com" in current_url:
+                return await self._check_current_page_logged_in()
+        except Exception:
+            pass
+
+        # Current page is not BOSS — navigate to check
         await self.page.goto(BOSS_BASE_URL, wait_until="networkidle")
         await asyncio.sleep(3)
-        current_url = self.page.url
-        if "login" in current_url or "/web/user" in current_url or "bticket" in current_url:
-            return False
-        body_class = await self.page.evaluate("document.body.className || ''")
-        if "login" in body_class:
-            return False
-        try:
-            logged_in = await self.page.query_selector(".user-nav, .btn-post-job, .nav-figure, .menu-list")
-            return logged_in is not None
-        except Exception:
-            return False
+        return await self._check_current_page_logged_in()
 
     async def _check_current_page_logged_in(self) -> bool:
         """Check login state from current page WITHOUT navigating away."""
@@ -208,6 +214,40 @@ class BossBrowser:
             return logged_in is not None
         except Exception:
             return False
+
+    async def check_and_screenshot_verification(self) -> dict | None:
+        """Check if the current page has a verification/CAPTCHA overlay.
+
+        Returns screenshot info if verification detected, None otherwise.
+        """
+        try:
+            has_verify = await self.page.evaluate("""() => {
+                const text = document.body.innerText || '';
+                const selectors = [
+                    '.verify-wrap', '.captcha', '.slider-verify',
+                    '[class*="verify"]', '[class*="captcha"]',
+                    '.boss-popup__wrapper'
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.offsetWidth > 0) return true;
+                }
+                return text.includes('安全验证') || text.includes('滑动验证')
+                    || text.includes('请完成验证');
+            }""")
+            if has_verify:
+                screenshot_path = os.path.join(
+                    os.path.dirname(__file__), "screenshot_verification.png"
+                )
+                await self.page.screenshot(path=screenshot_path)
+                return {
+                    "needs_verification": True,
+                    "screenshot": screenshot_path,
+                    "message": "检测到安全验证，请在浏览器中手动完成验证后告知",
+                }
+        except Exception:
+            pass
+        return None
 
     async def login(self) -> dict:
         """Navigate to login page. User needs to manually complete login."""
