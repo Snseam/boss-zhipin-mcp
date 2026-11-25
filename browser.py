@@ -116,7 +116,7 @@ class BossBrowser:
             if contexts:
                 self._context = contexts[0]
                 pages = self._context.pages
-                self._page = pages[0] if pages else await self._context.new_page()
+                self._page = self._select_best_page(pages) or await self._context.new_page()
             else:
                 self._context = await self._browser.new_context(
                     viewport={"width": 1440, "height": 900},
@@ -126,6 +126,57 @@ class BossBrowser:
             return True
         except Exception:
             return False
+
+    @staticmethod
+    def _is_verification_url(url: str) -> bool:
+        lower = (url or "").lower()
+        return any(
+            kw in lower for kw in ("verify-slider", "/safe/verify", "captcha", "/web/user/safe")
+        )
+
+    @classmethod
+    def _is_login_url(cls, url: str) -> bool:
+        lower = (url or "").lower()
+        if not lower or cls._is_verification_url(lower):
+            return False
+        return any(
+            kw in lower for kw in ("login.zhipin.com", "/web/user", "bticket", "/login")
+        )
+
+    @classmethod
+    def _is_recruiter_url(cls, url: str) -> bool:
+        lower = (url or "").lower()
+        if "zhipin.com" not in lower or cls._is_login_url(lower) or cls._is_verification_url(lower):
+            return False
+        return "/web/chat/" in lower or "/web/boss/" in lower
+
+    @classmethod
+    def _select_best_page(cls, pages: list[Page]) -> Page | None:
+        """Prefer an existing BOSS recruiter tab over arbitrary or blank tabs."""
+        best_page = None
+        best_score = -1
+        for candidate in pages or []:
+            try:
+                if hasattr(candidate, "is_closed") and candidate.is_closed():
+                    continue
+                url = candidate.url or ""
+            except Exception:
+                continue
+            lower = url.lower()
+            if cls._is_recruiter_url(lower):
+                score = 4
+            elif "zhipin.com" in lower and not cls._is_login_url(lower) and not cls._is_verification_url(lower):
+                score = 3
+            elif "zhipin.com" in lower:
+                score = 2
+            elif lower and not lower.startswith(("about:", "chrome:", "devtools:")):
+                score = 1
+            else:
+                score = 0
+            if score > best_score:
+                best_score = score
+                best_page = candidate
+        return best_page
 
     async def _launch_new_browser(self):
         """Fallback: launch a new Chromium instance (user must log in manually)."""
@@ -184,33 +235,93 @@ class BossBrowser:
     async def is_logged_in(self) -> bool:
         """Check if currently logged in to BOSS 直聘.
 
-        First tries to check from current page without navigation.
-        Only navigates if current page is not a BOSS page.
+        Checks the current tab and any other open BOSS tabs without navigating first.
+        Avoids navigating away from active login or verification screens.
         """
-        # Try checking current page first (no navigation)
-        try:
-            current_url = self.page.url
-            if "zhipin.com" in current_url:
-                return await self._check_current_page_logged_in()
-        except Exception:
-            pass
+        logged_page = await self._find_logged_in_page()
+        if logged_page is not None:
+            self._page = logged_page
+            return True
 
-        # Current page is not BOSS — navigate to check
-        await self.page.goto(BOSS_BASE_URL, wait_until="networkidle")
-        await asyncio.sleep(3)
+        try:
+            current_url = self.page.url or ""
+        except Exception:
+            current_url = ""
+
+        if self._is_verification_url(current_url) or self._is_login_url(current_url):
+            return False
+        if "zhipin.com" in current_url.lower():
+            return False
+
+        # Current page is not BOSS — navigate once to recruiter portal (not consumer homepage)
+        await self.page.goto(f"{BOSS_BASE_URL}/web/chat/recommend", wait_until="domcontentloaded")
+        await asyncio.sleep(2)
         return await self._check_current_page_logged_in()
 
-    async def _check_current_page_logged_in(self) -> bool:
-        """Check login state from current page WITHOUT navigating away."""
-        current_url = self.page.url
-        if "login" in current_url or "/web/user" in current_url or "bticket" in current_url:
-            body_class = await self.page.evaluate("document.body.className || ''")
-            if "login" in body_class:
-                return False
-        if "/web/boss/" in current_url or "/web/chat/" in current_url:
-            return True
+    async def _find_logged_in_page(self) -> Page | None:
+        """Scan current and open pages for an already-authenticated BOSS tab."""
+        candidates: list[Page] = []
+        if self._page is not None:
+            candidates.append(self._page)
+        if self._context is not None:
+            try:
+                for page in self._context.pages:
+                    if page not in candidates:
+                        candidates.append(page)
+            except Exception:
+                pass
+
+        for candidate in candidates:
+            try:
+                if hasattr(candidate, "is_closed") and candidate.is_closed():
+                    continue
+                if await self._check_current_page_logged_in(candidate):
+                    return candidate
+            except Exception:
+                continue
+        return None
+
+    async def _check_current_page_logged_in(self, target_page: Page | None = None) -> bool:
+        """Check login state from a page WITHOUT navigating away."""
+        page = target_page or self.page
         try:
-            logged_in = await self.page.query_selector(".user-nav, .btn-post-job, .nav-figure, .menu-list")
+            if hasattr(page, "is_closed") and page.is_closed():
+                return False
+            current_url = page.url or ""
+        except Exception:
+            return False
+
+        lower_url = current_url.lower()
+        if not lower_url or lower_url.startswith("about:") or "zhipin.com" not in lower_url:
+            return False
+        if self._is_verification_url(lower_url) or self._is_login_url(lower_url):
+            return False
+
+        if self._is_recruiter_url(lower_url):
+            try:
+                blocked = await page.evaluate("""() => {
+                    const bodyClass = (document.body && document.body.className) || '';
+                    if (bodyClass.includes('login')) return true;
+                    const blockers = [
+                        '.login-form', '.sign-form', '.qr-code-box',
+                        '.verify-wrap', '.slider-verify'
+                    ];
+                    for (const sel of blockers) {
+                        const el = document.querySelector(sel);
+                        if (el && el.offsetWidth > 0) return true;
+                    }
+                    return false;
+                }""")
+                return not blocked
+            except Exception:
+                # Page may be mid-navigation; let callers retry instead of crashing
+                return False
+
+        try:
+            logged_in = await page.query_selector(
+                ".user-nav, .btn-post-job, .nav-figure, .menu-list, "
+                ".nav-chat, dl.menu-geeksearch, a[ka='menu-geek-search'], .boss-info"
+            )
             return logged_in is not None
         except Exception:
             return False
@@ -249,15 +360,46 @@ class BossBrowser:
             pass
         return None
 
-    async def login(self) -> dict:
+    async def login(self, poll_interval: float = 2.0, max_polls: int = 90) -> dict:
         """Navigate to login page. User needs to manually complete login."""
-        await self.page.goto(f"{BOSS_BASE_URL}/web/user/?ka=header-login", wait_until="domcontentloaded")
+        logged_page = await self._find_logged_in_page()
+        if logged_page is not None:
+            self._page = logged_page
+            await self._save_cookies()
+            return {"status": "success", "message": "已登录，Cookie 已保存", "url": self.page.url}
 
-        for _ in range(90):
-            await asyncio.sleep(2)
-            if await self._check_current_page_logged_in():
+        verify = await self.check_and_screenshot_verification()
+        if verify:
+            return verify
+
+        current_url = ""
+        try:
+            current_url = self.page.url or ""
+        except Exception:
+            pass
+
+        if not self._is_login_url(current_url):
+            await self.page.goto(
+                f"{BOSS_BASE_URL}/web/user/?ka=header-login",
+                wait_until="domcontentloaded",
+            )
+
+        for _ in range(max_polls):
+            await asyncio.sleep(poll_interval)
+            logged_page = await self._find_logged_in_page()
+            if logged_page is not None:
+                self._page = logged_page
                 await self._save_cookies()
-                return {"status": "success", "message": "登录成功，Cookie 已保存"}
+                return {"status": "success", "message": "登录成功，Cookie 已保存", "url": self.page.url}
+
+            try:
+                polled_url = self.page.url or ""
+            except Exception:
+                polled_url = ""
+            if self._is_verification_url(polled_url):
+                verify = await self.check_and_screenshot_verification()
+                if verify:
+                    return verify
 
         return {"status": "timeout", "message": "登录超时（3分钟），请在浏览器中完成登录后重试"}
 

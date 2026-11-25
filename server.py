@@ -62,6 +62,9 @@ async def boss_login() -> dict:
     browser = await get_browser()
     if await browser.is_logged_in():
         return {"status": "success", "message": "已登录，Cookie 有效"}
+    verify = await browser.check_and_screenshot_verification()
+    if verify:
+        return verify
     return await browser.login()
 
 
