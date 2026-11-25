@@ -3,8 +3,12 @@
 import json
 import os
 import asyncio
+import platform
 import random
 import logging
+import shutil
+import subprocess
+import urllib.request
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from config import (
     COOKIES_DIR, COOKIES_FILE,
@@ -32,74 +36,151 @@ class BossBrowser:
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
+        self.connection_mode: str = "disconnected"
+
+    @staticmethod
+    def _ensure_no_proxy_localhost():
+        """Ensure localhost and 127.0.0.1 bypass system HTTP proxies for CDP."""
+        for env_key in ("NO_PROXY", "no_proxy"):
+            existing = os.environ.get(env_key, "")
+            entries = [item.strip() for item in existing.split(",") if item.strip()]
+            lowered = {item.lower() for item in entries}
+            updated = False
+            for host in ("localhost", "127.0.0.1"):
+                if host not in lowered:
+                    entries.append(host)
+                    lowered.add(host)
+                    updated = True
+            if updated:
+                os.environ[env_key] = ",".join(entries)
+
+    @staticmethod
+    def _cdp_candidate_urls() -> list[str]:
+        """Build deduplicated CDP endpoint URLs, preferring IPv4 127.0.0.1 fallback."""
+        urls: list[str] = []
+        configured = (os.getenv("BOSS_CDP_URL") or CDP_URL).strip()
+        if configured:
+            urls.append(configured)
+            if "://localhost:" in configured:
+                urls.append(configured.replace("://localhost:", "://127.0.0.1:", 1))
+        for port in CDP_DETECT_PORTS:
+            urls.append(f"http://127.0.0.1:{port}")
+            urls.append(f"http://localhost:{port}")
+        deduped: list[str] = []
+        seen = set()
+        for url in urls:
+            if url not in seen:
+                seen.add(url)
+                deduped.append(url)
+        return deduped
+
+    @staticmethod
+    def _is_cdp_ready(port: int, timeout: float = 2.0) -> bool:
+        """Check local Chrome debug endpoint directly without using system proxy."""
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        for host in ("127.0.0.1", "localhost"):
+            try:
+                with opener.open(f"http://{host}:{port}/json/version", timeout=timeout) as resp:
+                    if getattr(resp, "status", 200) == 200:
+                        return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def _find_system_chrome() -> str | None:
+        """Locate a system Chrome/Edge binary across macOS, Windows, and Linux."""
+        override = os.getenv("BOSS_CHROME_PATH", "").strip()
+        if override and os.path.exists(override):
+            return override
+
+        system = platform.system()
+        candidates: list[str] = []
+        if system == "Darwin":
+            candidates = [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            ]
+        elif system == "Windows":
+            local_app_data = os.getenv("LOCALAPPDATA", "")
+            program_files = os.getenv("PROGRAMFILES", r"C:\Program Files")
+            program_files_x86 = os.getenv("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+            for base in (program_files, program_files_x86, local_app_data):
+                if not base:
+                    continue
+                candidates.append(os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"))
+                candidates.append(os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"))
+        else:
+            for binary in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "microsoft-edge"):
+                found = shutil.which(binary)
+                if found:
+                    candidates.append(found)
+
+        for path in candidates:
+            if path and os.path.exists(path):
+                return path
+        return None
 
     async def launch(self):
         """Connect to Chrome via CDP with automatic fallback."""
+        self._ensure_no_proxy_localhost()
         self._playwright = await async_playwright().start()
 
-        # Strategy 1: Try configured CDP URL
-        if await self._try_cdp_connect(CDP_URL):
-            log.info(f"Connected via CDP: {CDP_URL}")
-            return
-
-        # Strategy 2: Auto-detect Chrome debug port
-        for port in CDP_DETECT_PORTS:
-            url = f"http://localhost:{port}"
-            if url == CDP_URL:
-                continue  # already tried
-            if await self._try_cdp_connect(url):
-                log.info(f"Auto-detected Chrome at port {port}")
+        # Strategy 1 & 2: Try configured CDP URL and auto-detect common debug ports
+        for cdp_url in self._cdp_candidate_urls():
+            if await self._try_cdp_connect(cdp_url):
+                self.connection_mode = "cdp"
+                log.info(f"Connected via CDP: {cdp_url}")
                 return
 
         # Strategy 3: Launch system Chrome with debug port, then connect via CDP
         log.info("No running Chrome found, launching system Chrome with debug port")
         launched_port = await self._launch_system_chrome()
         if launched_port:
-            cdp_url = f"http://localhost:{launched_port}"
-            if await self._try_cdp_connect(cdp_url):
-                log.info(f"Connected to system Chrome at port {launched_port}")
-                return
+            for host in ("127.0.0.1", "localhost"):
+                cdp_url = f"http://{host}:{launched_port}"
+                if await self._try_cdp_connect(cdp_url):
+                    self.connection_mode = "cdp"
+                    log.info(f"Connected to system Chrome at {cdp_url}")
+                    return
 
-        # Strategy 4: Fallback to bare Chromium (no user profile)
-        log.info("System Chrome launch failed, falling back to bare Chromium")
+        # Strategy 4: Fallback to persistent browser context
+        log.info("System Chrome CDP launch failed, falling back to persistent browser context")
         await self._launch_new_browser()
 
     async def _launch_system_chrome(self) -> int | None:
         """Launch system Chrome with --remote-debugging-port.
 
-        Uses the user's default Chrome profile so existing cookies/logins are available.
+        Uses a dedicated user-data-dir so Chrome can expose the debug port even when
+        another Chrome window is already open.
         Returns the debug port if successful, None otherwise.
         """
-        import subprocess
-        import platform
-
         port = 9222
-        system = platform.system()
-        if system == "Darwin":
-            chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        elif system == "Linux":
-            chrome_path = "google-chrome"
-        else:
-            chrome_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        chrome_path = self._find_system_chrome()
+        if not chrome_path:
+            log.warning("System Chrome/Edge executable not found")
+            return None
 
         # Use a dedicated user-data-dir so debug port works even if Chrome was running
         profile_dir = os.path.join(os.path.dirname(__file__), "chrome-profile")
         try:
             subprocess.Popen(
-                [chrome_path, f"--remote-debugging-port={port}",
-                 f"--user-data-dir={profile_dir}"],
+                [
+                    chrome_path,
+                    f"--remote-debugging-port={port}",
+                    f"--user-data-dir={profile_dir}",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
             # Wait for Chrome to start and debug port to be ready
             for _ in range(15):
                 await asyncio.sleep(1)
-                try:
-                    import urllib.request
-                    urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=2)
+                if self._is_cdp_ready(port):
                     return port
-                except Exception:
-                    continue
         except FileNotFoundError:
             log.warning(f"Chrome not found at {chrome_path}")
         except Exception as e:
@@ -179,27 +260,55 @@ class BossBrowser:
         return best_page
 
     async def _launch_new_browser(self):
-        """Fallback: launch a new Chromium instance (user must log in manually)."""
-        self._browser = await self._playwright.chromium.launch(
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        self._context = await self._browser.new_context(
-            viewport={"width": 1440, "height": 900},
-            locale="zh-CN",
-        )
+        """Fallback: launch a persistent Chrome/Chromium context without automation banner."""
+        profile_dir = os.path.join(os.path.dirname(__file__), "chrome-profile")
+        os.makedirs(profile_dir, exist_ok=True)
+        launch_kwargs = {
+            "headless": False,
+            "viewport": {"width": 1440, "height": 900},
+            "locale": "zh-CN",
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+            "ignore_default_args": ["--enable-automation"],
+        }
+        try:
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                profile_dir,
+                channel="chrome",
+                **launch_kwargs,
+            )
+            self.connection_mode = "persistent_chrome"
+        except Exception as exc:
+            log.warning("Persistent Chrome channel unavailable (%s); using Chromium fallback", exc)
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                profile_dir,
+                **launch_kwargs,
+            )
+            self.connection_mode = "persistent_chromium"
+
+        self._browser = getattr(self._context, "browser", None)
         await self._load_cookies()
-        self._page = await self._context.new_page()
+        pages = self._context.pages
+        self._page = self._select_best_page(pages) or await self._context.new_page()
 
     async def close(self):
         """Disconnect (does NOT close the user's Chrome)."""
         if self._context:
             await self._save_cookies()
+            if self.connection_mode != "cdp":
+                try:
+                    await self._context.close()
+                except Exception:
+                    pass
         if self._playwright:
             await self._playwright.stop()
         self._browser = None
         self._context = None
         self._page = None
+        self.connection_mode = "disconnected"
 
     @property
     def page(self) -> Page:
@@ -211,23 +320,35 @@ class BossBrowser:
     def is_alive(self) -> bool:
         """Check if browser is still connected."""
         try:
-            return self._browser is not None and self._browser.is_connected()
+            if self._browser is not None:
+                return self._browser.is_connected()
+            if self._page is not None:
+                return not self._page.is_closed()
+            return False
         except Exception:
             return False
 
     async def _load_cookies(self):
-        """Load cookies from file."""
-        if os.path.exists(COOKIES_FILE):
-            with open(COOKIES_FILE, "r") as f:
+        """Load cookies from file when the context has no existing BOSS cookies."""
+        if not self._context or not os.path.exists(COOKIES_FILE):
+            return
+        try:
+            existing = await self._context.cookies()
+            if any("zhipin.com" in (c.get("domain") or "") for c in existing):
+                return
+            with open(COOKIES_FILE, "r", encoding="utf-8") as f:
                 cookies = json.load(f)
-            await self._context.add_cookies(cookies)
+            if isinstance(cookies, list) and cookies:
+                await self._context.add_cookies(cookies)
+        except Exception as exc:
+            log.warning("Failed to load saved cookies: %s", exc)
 
     async def _save_cookies(self):
         """Save cookies to file."""
         os.makedirs(COOKIES_DIR, exist_ok=True)
         try:
             cookies = await self._context.cookies()
-            with open(COOKIES_FILE, "w") as f:
+            with open(COOKIES_FILE, "w", encoding="utf-8") as f:
                 json.dump(cookies, f, indent=2)
         except Exception:
             pass
@@ -384,6 +505,7 @@ class BossBrowser:
                 wait_until="domcontentloaded",
             )
 
+        blank_hits = 0
         for _ in range(max_polls):
             await asyncio.sleep(poll_interval)
             logged_page = await self._find_logged_in_page()
@@ -393,9 +515,25 @@ class BossBrowser:
                 return {"status": "success", "message": "登录成功，Cookie 已保存", "url": self.page.url}
 
             try:
-                polled_url = self.page.url or ""
+                polled_url = (self.page.url or "").strip()
             except Exception:
                 polled_url = ""
+
+            if polled_url.lower() in ("", "about:blank"):
+                blank_hits += 1
+                if blank_hits >= 2:
+                    return {
+                        "status": "blocked_about_blank",
+                        "connection_mode": self.connection_mode,
+                        "message": (
+                            "登录页自动跳转至 about:blank 白屏（通常是 BOSS 检测到非 CDP 自动化浏览器环境）。"
+                            "请先手动以调试端口启动系统 Chrome（--remote-debugging-port=9222），"
+                            "在 Chrome 中打开 https://www.zhipin.com 完成登录后，再重新调用 MCP 工具。"
+                        ),
+                    }
+                continue
+
+            blank_hits = 0
             if self._is_verification_url(polled_url):
                 verify = await self.check_and_screenshot_verification()
                 if verify:
