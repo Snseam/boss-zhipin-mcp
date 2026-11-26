@@ -221,6 +221,10 @@ class BossBrowser:
         Returns screenshot info if verification detected, None otherwise.
         """
         try:
+            current_url = (self.page.url or "").lower()
+            url_is_verify = any(
+                kw in current_url for kw in ("verify-slider", "/safe/verify", "captcha", "/web/user/safe")
+            )
             has_verify = await self.page.evaluate("""() => {
                 const text = document.body.innerText || '';
                 const selectors = [
@@ -233,9 +237,10 @@ class BossBrowser:
                     if (el && el.offsetWidth > 0) return true;
                 }
                 return text.includes('安全验证') || text.includes('滑动验证')
-                    || text.includes('请完成验证');
+                    || text.includes('请完成验证') || text.includes('操作过于频繁')
+                    || text.includes('行为异常') || text.includes('访问异常');
             }""")
-            if has_verify:
+            if url_is_verify or has_verify:
                 screenshot_path = os.path.join(
                     os.path.dirname(__file__), "screenshot_verification.png"
                 )

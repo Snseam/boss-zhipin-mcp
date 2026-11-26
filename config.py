@@ -25,6 +25,11 @@ MIN_DELAY = 2.0  # 最小随机延迟（秒）
 MAX_DELAY = 5.0  # 最大随机延迟（秒）
 MAX_CANDIDATES_PER_SESSION = 30  # 单次会话最大抓取数
 
+# 搜索节流与安全限制（可通过环境变量覆盖）
+SEARCH_MIN_INTERVAL = float(os.getenv("BOSS_SEARCH_MIN_INTERVAL", "15"))  # 两次搜索最小间隔（秒）
+SEARCH_JITTER_MAX = float(os.getenv("BOSS_SEARCH_JITTER_MAX", "3"))       # 随机抖动上限（秒）
+MAX_SEARCHES_PER_DAY = int(os.getenv("BOSS_MAX_SEARCHES_PER_DAY", "60"))  # 单日搜索次数上限（0 表示不限）
+
 # AI 评估
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 EVAL_MODEL = "claude-sonnet-4-20250514"

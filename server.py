@@ -102,6 +102,8 @@ async def boss_search_candidates(
 
     # Check for error responses from scraper
     if all_candidates and isinstance(all_candidates[0], dict) and all_candidates[0].get("error"):
+        if all_candidates[0].get("needs_verification"):
+            return all_candidates
         verify = await browser.check_and_screenshot_verification()
         if verify:
             return [verify]
@@ -187,12 +189,18 @@ async def boss_multi_search(
 
         # Check for error responses
         if raw and isinstance(raw[0], dict) and raw[0].get("error"):
+            err = raw[0]
+            if err.get("error") in ("risk_control", "login_required", "rate_limit") or err.get("needs_verification"):
+                stop_notice = dict(err)
+                stop_notice["_partial"] = True
+                stop_notice["completed_keywords"] = i
+                return [stop_notice] + per_keyword_stats + all_new_candidates
             verify = await browser.check_and_screenshot_verification()
             if verify:
                 verify["_partial"] = True
                 verify["completed_keywords"] = i
                 return [verify] + per_keyword_stats + all_new_candidates
-            log.warning(f"search '{kw}' returned error: {raw[0].get('error')}")
+            log.warning(f"search '{kw}' returned error: {err.get('error')}")
             continue
 
         new_for_kw = []
