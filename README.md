@@ -257,6 +257,20 @@ boss-zhipin-mcp/
 
 ## 常见问题
 
+### `Starting MCP server 'boss-recruiter' with transport 'stdio'` 看似卡住或无法启动
+
+1. **直接在终端运行 `python server.py` 停在启动提示**：这是 `stdio` 模式 MCP Server 的正常表现——服务已就绪，正在等待 MCP 客户端通过标准输入输出（JSON-RPC）通信，不要直接当 Web 服务在终端里运行，而是通过 Claude Code / Claude Desktop 等 MCP 客户端配置启动。
+2. **验证环境是否正常**：运行以下命令做启动自检（会立即退出并在 `stderr` 输出诊断 JSON）：
+
+   ```bash
+   .venv/bin/python server.py --check
+   ```
+
+3. **在 MCP 客户端中启动失败**：
+   - 确认配置中的 `command` 指向虚拟环境里的 Python 绝对路径（macOS/Linux 为 `.venv/bin/python`，Windows 为 `.venv\\Scripts\\python.exe`），而不是系统 `python`。
+   - 确认已安装依赖：`pip install -r requirements.txt`（如果未安装系统 `zbar` 底层库，服务仍可正常启动，仅 QR 解码会自动降级）。
+   - 如需 HTTP 模式调试，可运行 `python server.py --transport streamable-http --port 8090`。
+
 ### 连接失败 `Unexpected status 400`
 
 系统有代理（如 Clash），localhost 请求被代理拦截。在 MCP 配置中添加：

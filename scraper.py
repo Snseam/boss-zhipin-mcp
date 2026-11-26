@@ -19,7 +19,7 @@ try:
     from pyzbar.pyzbar import decode as decode_qr
     import io
     HAS_QR_DECODER = True
-except ImportError:
+except (ImportError, OSError):
     HAS_QR_DECODER = False
 
 log = logging.getLogger("boss-scraper")

@@ -1,8 +1,19 @@
 """BOSS 直聘招聘者 MCP Server — 候选人筛选与评估."""
 
+import argparse
+import inspect
+import json
+import logging
 import sys
 import os
 import importlib
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
+
+logging.basicConfig(stream=sys.stderr, level=logging.INFO)
+
 from fastmcp import FastMCP
 import browser as browser_mod
 import scraper as scraper_mod
@@ -887,10 +898,67 @@ async def boss_reload() -> dict:
         return {"status": "error", "message": str(e)}
 
 
-if __name__ == "__main__":
-    if "--transport" in sys.argv and "http" in sys.argv:
-        port_idx = sys.argv.index("--port") if "--port" in sys.argv else -1
-        port = int(sys.argv[port_idx + 1]) if port_idx >= 0 else 8090
-        mcp.run(transport="streamable-http", port=port)
+def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments for MCP server startup."""
+    parser = argparse.ArgumentParser(description="BOSS 直聘招聘者 MCP Server")
+    parser.add_argument(
+        "--transport",
+        default="stdio",
+        choices=["stdio", "http", "streamable-http"],
+        help="MCP transport mode (default: stdio)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8090,
+        help="Port for streamable-http transport (default: 8090)",
+    )
+    parser.add_argument(
+        "--show-banner",
+        action="store_true",
+        help="Show FastMCP startup banner on stderr",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Run startup self-check and exit without starting the server",
+    )
+    return parser.parse_args(argv)
+
+
+def startup_check() -> dict:
+    """Return basic startup diagnostics without touching stdout."""
+    return {
+        "status": "ok",
+        "server": "boss-recruiter",
+        "python": sys.version.split()[0],
+        "qr_decoder_available": bool(getattr(scraper_mod, "HAS_QR_DECODER", False)),
+        "profile_loaded": bool(PROFILE),
+        "candidates_in_db": _db.stats()["total"],
+    }
+
+
+def run_server(argv: list[str] | None = None) -> int:
+    """Run the MCP server with clean stdio hygiene."""
+    args = parse_cli_args(argv)
+    if args.check:
+        sys.stderr.write(json.dumps(startup_check(), ensure_ascii=False) + "\n")
+        return 0
+
+    run_kwargs = {}
+    try:
+        params = inspect.signature(mcp.run).parameters
+        if "show_banner" in params and not args.show_banner:
+            run_kwargs["show_banner"] = False
+    except (TypeError, ValueError):
+        pass
+
+    if args.transport in ("http", "streamable-http"):
+        mcp.run(transport="streamable-http", port=args.port, **run_kwargs)
     else:
-        mcp.run()
+        mcp.run(**run_kwargs)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_server())
