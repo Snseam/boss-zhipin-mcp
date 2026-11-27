@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/Python-3.12+-green)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-**BOSS 直聘 (zhipin.com)** 招聘者端自动化工具，基于 [Model Context Protocol (MCP)](https://modelcontextprotocol.io)，让 Claude Code / Claude Desktop 等 AI 助手直接操作 BOSS 直聘招聘后台。
+**BOSS 直聘 (zhipin.com)** 招聘者端自动化工具，基于 [Model Context Protocol (MCP)](https://modelcontextprotocol.io)，让 Claude Code、Claude Desktop、WorkBuddy、Cursor、VS Code、Codex 等支持 MCP 的桌面端 AI 助手直接操作 BOSS 直聘招聘后台。
 
 ## 功能特性
 
@@ -24,7 +24,7 @@
 ## 工作原理
 
 ```
-Claude Code / Claude Desktop
+Claude Code / WorkBuddy / Cursor / 其他 MCP 客户端
     ↓ MCP (stdio)
 boss-zhipin-mcp (FastMCP Server)
     ↓ CDP (Chrome DevTools Protocol)
@@ -107,9 +107,9 @@ scoring:
 
 在浏览器中打开 [zhipin.com](https://www.zhipin.com) 并登录你的招聘者账号。
 
-### 4. 连接 Claude Code
+### 4. 连接 MCP 客户端
 
-在项目根目录创建 `.mcp.json`：
+以 **Claude Code** 为例，在项目根目录创建 `.mcp.json`：
 
 ```json
 {
@@ -124,6 +124,8 @@ scoring:
   }
 }
 ```
+
+> **使用其他平台？** 本项目支持所有兼容本地 `stdio` / `streamable-http` 的桌面端 MCP 客户端。**WorkBuddy、Claude Desktop、Cursor、VS Code（GitHub Copilot）、Codex、Cherry Studio / Trae / Windsurf / Cline** 等完整配置示例与超时注意事项，请查看 [多平台 MCP 客户端配置指南](docs/mcp-clients.md)。
 
 ### 5. 开始使用
 
@@ -249,6 +251,7 @@ boss-zhipin-mcp/
 ├── candidate_db.py            # 候选人数据库（持久化 + 去重 + 查询）
 ├── evaluator.py               # 候选人评估（关键词匹配）
 ├── config.py                  # 配置加载
+├── docs/mcp-clients.md        # 多平台 MCP 客户端配置指南（WorkBuddy/Cursor/VS Code 等）
 ├── search_profile.example.yaml # 搜索配置示例
 ├── candidates_db.json         # 候选人数据库文件（自动生成）
 ├── requirements.txt
@@ -259,7 +262,7 @@ boss-zhipin-mcp/
 
 ### `Starting MCP server 'boss-recruiter' with transport 'stdio'` 看似卡住或无法启动
 
-1. **直接在终端运行 `python server.py` 停在启动提示**：这是 `stdio` 模式 MCP Server 的正常表现——服务已就绪，正在等待 MCP 客户端通过标准输入输出（JSON-RPC）通信，不要直接当 Web 服务在终端里运行，而是通过 Claude Code / Claude Desktop 等 MCP 客户端配置启动。
+1. **直接在终端运行 `python server.py` 停在启动提示**：这是 `stdio` 模式 MCP Server 的正常表现——服务已就绪，正在等待 MCP 客户端通过标准输入输出（JSON-RPC）通信，不要直接当 Web 服务在终端里运行，而是通过 Claude Code / WorkBuddy / Cursor 等 MCP 客户端配置启动（详见 [多平台 MCP 客户端配置指南](docs/mcp-clients.md)）。
 2. **验证环境是否正常**：运行以下命令做启动自检（会立即退出并在 `stderr` 输出诊断 JSON）：
 
    ```bash
